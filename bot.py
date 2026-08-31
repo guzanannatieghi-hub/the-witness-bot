@@ -45,6 +45,16 @@ GROUP_ID = 5008654
 STAFF_MIN_RANK = 50
 
 CONNECTIONS_CHANNEL = "connections"
+PRESENCE_CHANNEL = "leadership-presence"
+CURRENT_SERVER_CHANNEL = "current-server"
+
+# De Pride Isle Sanatorium
+DPI_PLACE_ID = 3522803956
+DPI_UNIVERSE_ID = 1246853548
+PRESENCE_SCAN_MINUTES = 2
+CURRENT_SERVER_REFRESH_MINUTES = 5
+PRESENCE_STATE_FILE = "witness_presence_state.json"
+CURRENT_SERVER_STATE_FILE = "witness_current_server_state.json"
 
 STAFF_SCAN_MINUTES = 5
 LEADER_GRAPH_MINUTES = 30
@@ -60,6 +70,7 @@ PRIVACY_FILE = "witness_privacy_cache.json"
 GROUPS_API = "https://groups.roblox.com"
 FRIENDS_API = "https://friends.roblox.com"
 USERS_API = "https://users.roblox.com"
+PRESENCE_API = "https://presence.roblox.com"
 
 TEAM_CONCURRENCY = 4
 MAX_MULTI_USERS = 25
@@ -401,6 +412,73 @@ async def probe_friends_visibility(session, user_id):
         "http_status": None,
     }
 
+
+
+# =========================================================
+# ROBLOX PRESENCE
+# =========================================================
+
+async def get_user_presences(session, user_ids):
+    """
+    Roblox's public presence endpoint accepts a batch of user IDs.
+    It can expose place/universe information only when Roblox allows that
+    user's presence to be visible. We do not attempt to bypass hidden presence.
+    """
+    if not user_ids:
+        return {}
+
+    data = await request_json(
+        session,
+        "POST",
+        f"{PRESENCE_API}/v1/presence/users",
+        payload={
+            "userIds": [
+                int(user_id)
+                for user_id in user_ids
+            ]
+        },
+    )
+
+    results = {}
+
+    for item in data.get("userPresences", []):
+        user_id = item.get("userId")
+
+        if user_id is None:
+            continue
+
+        results[str(user_id)] = item
+
+    return results
+
+
+def presence_is_dpi(presence):
+    """
+    Detect the De Pride Isle Sanatorium experience.
+    universeId is preferred; rootPlaceId/placeId are fallbacks.
+    """
+    if not presence:
+        return False
+
+    universe_id = presence.get("universeId")
+    root_place_id = presence.get("rootPlaceId")
+    place_id = presence.get("placeId")
+
+    return (
+        str(universe_id) == str(DPI_UNIVERSE_ID)
+        or str(root_place_id) == str(DPI_PLACE_ID)
+        or str(place_id) == str(DPI_PLACE_ID)
+    )
+
+
+def presence_location_text(presence):
+    if not presence:
+        return "Unknown"
+
+    return (
+        presence.get("lastLocation")
+        or "De Pride Isle Sanatorium"
+    )
 
 # =========================================================
 # STAFF + LEADERSHIP SNAPSHOT
@@ -2015,6 +2093,41 @@ async def witnessstatus(
         inline=True,
     )
 
+    presence_state = load_json(
+        PRESENCE_STATE_FILE,
+        {},
+    )
+
+    visible_in_dpi = sum(
+        1
+        for item in presence_state.values()
+        if item.get("in_dpi")
+    )
+
+    embed.add_field(
+        name="DPI Presence Watch",
+        value=(
+            f"Every {PRESENCE_SCAN_MINUTES} min • "
+            f"{visible_in_dpi} visible in-game"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Presence Output",
+        value=f"#{PRESENCE_CHANNEL}",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Current Server Roster",
+        value=(
+            f"Every {CURRENT_SERVER_REFRESH_MINUTES} min • "
+            f"#{CURRENT_SERVER_CHANNEL}"
+        ),
+        inline=False,
+    )
+
     embed.set_footer(
         text=(
             "Team scans use cached leader graph: "
@@ -2291,6 +2404,677 @@ async def before_graph_refresh():
     await bot.wait_until_ready()
 
 
+
+# =========================================================
+# LEADERSHIP PRESENCE WATCH
+# =========================================================
+
+def tracked_leadership(snapshot):
+    """
+    Uses the same automatically-discovered leadership set as The Witness:
+    - every current Matrona
+    - every current Reverend rank
+    - Divine Sister / Roblox group owner
+    """
+    return snapshot.get("leaders", {})
+
+
+async def post_presence_joins(guild, joined):
+    if not joined:
+        return
+
+    channel = find_channel(
+        guild,
+        PRESENCE_CHANNEL,
+    )
+
+    if not channel:
+        print(
+            f"Witness presence: #{PRESENCE_CHANNEL} "
+            f"does not exist in {guild.name}."
+        )
+        return
+
+    lines = []
+
+    for event in joined:
+        leader = event["leader"]
+        presence = event["presence"]
+
+        username = leader.get(
+            "username",
+            "Unknown",
+        )
+
+        role_name = leader.get(
+            "role_name",
+            leader.get(
+                "category",
+                "Leadership",
+            ),
+        )
+
+        location = presence_location_text(
+            presence
+        )
+
+        lines.append(
+            f"👁️ **{username}** — {role_name}\n"
+            f"↳ Joined **De Pride Isle Sanatorium**\n"
+            f"↳ `{location}`\n"
+            f"↳ [Roblox profile]"
+            f"({profile_url(event['user_id'])})"
+        )
+
+    chunks = []
+    current = ""
+
+    for block in lines:
+        piece = block + "\n\n"
+
+        if (
+            len(current) + len(piece) > 3800
+            and current
+        ):
+            chunks.append(
+                current.rstrip()
+            )
+            current = ""
+
+        current += piece
+
+    if current:
+        chunks.append(
+            current.rstrip()
+        )
+
+    for index, description in enumerate(
+        chunks
+    ):
+        suffix = (
+            f" • {index + 1}/{len(chunks)}"
+            if len(chunks) > 1
+            else ""
+        )
+
+        embed = discord.Embed(
+            title=(
+                f"👁️ DPI LEADERSHIP JOIN DETECTED "
+                f"— {len(joined)}{suffix}"
+            ),
+            description=description,
+            colour=discord.Colour.purple(),
+            timestamp=utc_now(),
+        )
+
+        embed.set_footer(
+            text=(
+                f"The Witness • checks every "
+                f"{PRESENCE_SCAN_MINUTES} min • "
+                "public Roblox presence only"
+            )
+        )
+
+        await channel.send(
+            embed=embed
+        )
+
+
+async def perform_presence_scan(
+    *,
+    post_joins=True,
+):
+    snapshot = await ensure_snapshot()
+    leaders = tracked_leadership(
+        snapshot
+    )
+
+    if not leaders:
+        return {
+            "tracked": 0,
+            "in_dpi": [],
+            "joined": [],
+            "hidden_or_other": 0,
+        }
+
+    headers = {
+        "User-Agent":
+        "The-Witness-Divine-Sister-Court/3.0"
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=30
+    )
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+    ) as session:
+        presences = await get_user_presences(
+            session,
+            list(leaders.keys()),
+        )
+
+    previous = load_json(
+        PRESENCE_STATE_FILE,
+        {},
+    )
+
+    new_state = {}
+    joined = []
+    in_dpi = []
+
+    for user_id, leader in leaders.items():
+        presence = presences.get(
+            str(user_id),
+            {},
+        )
+
+        is_dpi = presence_is_dpi(
+            presence
+        )
+
+        was_dpi = bool(
+            previous.get(
+                str(user_id),
+                {},
+            ).get(
+                "in_dpi",
+                False,
+            )
+        )
+
+        new_state[str(user_id)] = {
+            "in_dpi": is_dpi,
+            "last_checked": utc_iso(),
+            "presence_type":
+                presence.get(
+                    "userPresenceType"
+                ),
+            "place_id":
+                presence.get("placeId"),
+            "universe_id":
+                presence.get(
+                    "universeId"
+                ),
+            "game_id":
+                presence.get("gameId"),
+            "last_location":
+                presence.get(
+                    "lastLocation"
+                ),
+        }
+
+        if is_dpi:
+            in_dpi.append({
+                "user_id":
+                    str(user_id),
+                "leader": leader,
+                "presence":
+                    presence,
+            })
+
+        # Only announce a transition from "not currently known in DPI"
+        # to "currently visible in DPI". This prevents repeated spam.
+        if (
+            is_dpi
+            and not was_dpi
+            and previous
+        ):
+            joined.append({
+                "user_id":
+                    str(user_id),
+                "leader": leader,
+                "presence":
+                    presence,
+            })
+
+    save_json(
+        PRESENCE_STATE_FILE,
+        new_state,
+    )
+
+    if (
+        post_joins
+        and joined
+    ):
+        for guild in bot.guilds:
+            await post_presence_joins(
+                guild,
+                joined,
+            )
+
+    return {
+        "tracked": len(leaders),
+        "in_dpi": in_dpi,
+        "joined": joined,
+        "hidden_or_other":
+            len(leaders) - len(in_dpi),
+    }
+
+
+@tasks.loop(
+    minutes=PRESENCE_SCAN_MINUTES
+)
+async def leadership_presence_watch():
+    try:
+        result = await perform_presence_scan(
+            post_joins=True
+        )
+
+        if result["joined"]:
+            print(
+                f"Witness presence: "
+                f"{len(result['joined'])} "
+                f"DPI leadership join(s) detected."
+            )
+
+    except Exception as exc:
+        print(
+            "Leadership presence watcher error:",
+            repr(exc),
+        )
+
+
+@leadership_presence_watch.before_loop
+async def before_leadership_presence_watch():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(
+    name="presencecheck",
+    description=(
+        "Check which Matronas/Reverends/"
+        "Divine Sister are visibly in DPI now."
+    ),
+)
+async def presencecheck(
+    interaction: discord.Interaction,
+):
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    try:
+        result = await perform_presence_scan(
+            post_joins=False
+        )
+
+        current = result["in_dpi"]
+
+        if not current:
+            await interaction.followup.send(
+                (
+                    f"👁️ Checked **{result['tracked']}** "
+                    "leadership accounts. None are "
+                    "currently publicly visible inside "
+                    "De Pride Isle Sanatorium."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        lines = []
+
+        for item in current:
+            leader = item["leader"]
+
+            lines.append(
+                f"• **{leader.get('username', 'Unknown')}** "
+                f"— {leader.get('role_name', leader.get('category', 'Leadership'))}"
+            )
+
+        await interaction.followup.send(
+            (
+                f"👁️ **Currently visible in DPI — "
+                f"{len(current)}**\n"
+                + "\n".join(lines)
+                + "\n\nPresence privacy can hide some users."
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+        print(
+            "Manual presence check error:",
+            repr(exc),
+        )
+
+        await interaction.followup.send(
+            f"❌ Presence check failed: "
+            f"`{type(exc).__name__}`",
+            ephemeral=True,
+        )
+
+
+
+# =========================================================
+# CURRENT DPI SERVERS — LEADERSHIP ROSTER
+# =========================================================
+
+def group_presence_by_server(snapshot, presences):
+    """
+    Group currently visible DPI leadership users by Roblox server instance.
+    gameId is the live server instance identifier when Roblox exposes it.
+    """
+    leaders = tracked_leadership(snapshot)
+    grouped = {}
+    unknown_server = []
+
+    for user_id, leader in leaders.items():
+        presence = presences.get(str(user_id), {})
+
+        if not presence_is_dpi(presence):
+            continue
+
+        server_id = presence.get("gameId")
+        record = {
+            "user_id": str(user_id),
+            "leader": leader,
+            "presence": presence,
+        }
+
+        if server_id:
+            grouped.setdefault(str(server_id), []).append(record)
+        else:
+            unknown_server.append(record)
+
+    return grouped, unknown_server
+
+
+def build_current_server_embed(snapshot, presences):
+    grouped, unknown_server = group_presence_by_server(
+        snapshot,
+        presences,
+    )
+
+    total_visible = sum(
+        len(members)
+        for members in grouped.values()
+    ) + len(unknown_server)
+
+    embed = discord.Embed(
+        title="🛰️ CURRENT DPI LEADERSHIP SERVERS",
+        description=(
+            f"Publicly visible Matronas, Reverends, and Divine Sister "
+            f"currently inside **De Pride Isle Sanatorium**.\n\n"
+            f"Visible leadership in DPI: **{total_visible}**"
+        ),
+        colour=discord.Colour.blurple(),
+        timestamp=utc_now(),
+    )
+
+    if not grouped and not unknown_server:
+        embed.add_field(
+            name="No visible leadership detected",
+            value=(
+                "No tracked Matrona/Reverend/Divine Sister account "
+                "is currently publicly visible inside DPI."
+            ),
+            inline=False,
+        )
+
+    # Keep neat and compact: one field per detected live server.
+    for index, (server_id, members) in enumerate(
+        sorted(
+            grouped.items(),
+            key=lambda item: (
+                -len(item[1]),
+                item[0],
+            )
+        ),
+        start=1,
+    ):
+        lines = []
+
+        for record in sorted(
+            members,
+            key=lambda item: (
+                item["leader"].get("role_name", ""),
+                item["leader"].get("username", "").lower(),
+            )
+        ):
+            leader = record["leader"]
+
+            lines.append(
+                f"• **{leader.get('username', 'Unknown')}** "
+                f"— {leader.get('role_name', leader.get('category', 'Leadership'))}"
+            )
+
+        value = "\n".join(lines)
+
+        if len(value) > 1000:
+            value = value[:1000] + "\n…"
+
+        embed.add_field(
+            name=f"Server {index} • {len(members)} visible",
+            value=(
+                f"`gameId: {server_id}`\n"
+                f"{value}"
+            ),
+            inline=False,
+        )
+
+    if unknown_server:
+        lines = []
+
+        for record in sorted(
+            unknown_server,
+            key=lambda item: item["leader"].get("username", "").lower(),
+        ):
+            leader = record["leader"]
+
+            lines.append(
+                f"• **{leader.get('username', 'Unknown')}** "
+                f"— {leader.get('role_name', leader.get('category', 'Leadership'))}"
+            )
+
+        embed.add_field(
+            name="Visible in DPI • server instance hidden",
+            value="\n".join(lines)[:1024],
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=(
+            f"The Witness • refreshes every "
+            f"{CURRENT_SERVER_REFRESH_MINUTES} min • "
+            "public Roblox presence only"
+        )
+    )
+
+    return embed
+
+
+async def publish_current_server_roster(guild, snapshot, presences):
+    channel = find_channel(
+        guild,
+        CURRENT_SERVER_CHANNEL,
+    )
+
+    if not channel:
+        print(
+            f"Witness current-server: "
+            f"#{CURRENT_SERVER_CHANNEL} does not exist in {guild.name}."
+        )
+        return
+
+    embed = build_current_server_embed(
+        snapshot,
+        presences,
+    )
+
+    state = load_json(
+        CURRENT_SERVER_STATE_FILE,
+        {},
+    )
+
+    message_ids = state.get(
+        "message_ids",
+        {},
+    )
+
+    message_id = message_ids.get(
+        str(guild.id)
+    )
+
+    message = None
+
+    if message_id:
+        try:
+            message = await channel.fetch_message(
+                int(message_id)
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            ValueError,
+        ):
+            message = None
+
+    # Recover the existing roster if state file was lost.
+    if message is None:
+        try:
+            async for old in channel.history(limit=50):
+                if (
+                    old.author.id == bot.user.id
+                    and old.embeds
+                    and old.embeds[0].title
+                    == "🛰️ CURRENT DPI LEADERSHIP SERVERS"
+                ):
+                    message = old
+                    break
+        except discord.HTTPException:
+            pass
+
+    if message is None:
+        message = await channel.send(
+            embed=embed
+        )
+    else:
+        await message.edit(
+            embed=embed
+        )
+
+    message_ids[str(guild.id)] = str(
+        message.id
+    )
+
+    save_json(
+        CURRENT_SERVER_STATE_FILE,
+        {
+            "message_ids": message_ids,
+            "updated_at": utc_iso(),
+        },
+    )
+
+
+async def get_current_leadership_presences():
+    snapshot = await ensure_snapshot()
+    leaders = tracked_leadership(snapshot)
+
+    headers = {
+        "User-Agent":
+        "The-Witness-Divine-Sister-Court/3.1"
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=30
+    )
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+    ) as session:
+        presences = await get_user_presences(
+            session,
+            list(leaders.keys()),
+        )
+
+    return snapshot, presences
+
+
+@tasks.loop(
+    minutes=CURRENT_SERVER_REFRESH_MINUTES
+)
+async def current_server_roster_watch():
+    try:
+        snapshot, presences = (
+            await get_current_leadership_presences()
+        )
+
+        for guild in bot.guilds:
+            await publish_current_server_roster(
+                guild,
+                snapshot,
+                presences,
+            )
+
+    except Exception as exc:
+        print(
+            "Current server roster watcher error:",
+            repr(exc),
+        )
+
+
+@current_server_roster_watch.before_loop
+async def before_current_server_roster_watch():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(
+    name="currentservers",
+    description=(
+        "Refresh the current DPI leadership server roster now."
+    ),
+)
+async def currentservers(
+    interaction: discord.Interaction,
+):
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    try:
+        snapshot, presences = (
+            await get_current_leadership_presences()
+        )
+
+        await publish_current_server_roster(
+            interaction.guild,
+            snapshot,
+            presences,
+        )
+
+        channel = find_channel(
+            interaction.guild,
+            CURRENT_SERVER_CHANNEL,
+        )
+
+        await interaction.followup.send(
+            (
+                f"🛰️ Current DPI leadership servers refreshed in "
+                f"{channel.mention if channel else '#current-server'}."
+            ),
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+        print(
+            "Manual current-server refresh error:",
+            repr(exc),
+        )
+
+        await interaction.followup.send(
+            f"❌ Current server refresh failed: "
+            f"`{type(exc).__name__}`",
+            ephemeral=True,
+        )
+
+
 # =========================================================
 # READY / COMMAND SYNC
 # =========================================================
@@ -2360,6 +3144,12 @@ async def on_ready():
 
     if not leader_graph_refresh.is_running():
         leader_graph_refresh.start()
+
+    if not leadership_presence_watch.is_running():
+        leadership_presence_watch.start()
+
+    if not current_server_roster_watch.is_running():
+        current_server_roster_watch.start()
 
 
 # =========================================================
