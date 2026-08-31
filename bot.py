@@ -419,27 +419,65 @@ async def probe_friends_visibility(session, user_id):
 # =========================================================
 
 async def get_user_presences(session, user_ids):
+    """
+    Fetch Roblox public presence safely without exceeding the API's
+    per-request user-ID limit.
+
+    Starts with conservative batches of 50. If Roblox ever lowers the
+    accepted batch size, a rejected batch is automatically split in half
+    and retried instead of breaking the whole current-server scan.
+    """
     if not user_ids:
         return {}
 
     ids = [int(user_id) for user_id in user_ids]
     results = {}
 
-    for offset in range(0, len(ids), 100):
-        batch = ids[offset:offset + 100]
-        data = await request_json(
-            session,
-            "POST",
-            f"{PRESENCE_API}/v1/presence/users",
-            payload={"userIds": batch},
-        )
+    async def fetch_batch(batch):
+        if not batch:
+            return
+
+        try:
+            data = await request_json(
+                session,
+                "POST",
+                f"{PRESENCE_API}/v1/presence/users",
+                payload={"userIds": batch},
+            )
+
+        except RuntimeError as exc:
+            message = str(exc).lower()
+
+            # Roblox returns HTTP 400 / code 3 when too many IDs are sent.
+            # Split automatically so future API-limit changes do not kill
+            # the entire roster watcher.
+            if (
+                "too many user ids" in message
+                and len(batch) > 1
+            ):
+                middle = len(batch) // 2
+
+                await fetch_batch(batch[:middle])
+                await asyncio.sleep(0.15)
+                await fetch_batch(batch[middle:])
+                return
+
+            raise
 
         for item in data.get("userPresences", []):
             user_id = item.get("userId")
+
             if user_id is not None:
                 results[str(user_id)] = item
 
-        if offset + 100 < len(ids):
+    # 50 is intentionally conservative for Roblox Presence.
+    for offset in range(0, len(ids), 50):
+        batch = ids[offset:offset + 50]
+
+        await fetch_batch(batch)
+
+        if offset + 50 < len(ids):
+            # Gentle spacing between requests to reduce burst pressure.
             await asyncio.sleep(0.25)
 
     return results
@@ -3052,7 +3090,7 @@ async def get_current_staff_presences(snapshot=None):
 
     people = all_tracked_people(snapshot)
 
-    headers = {"User-Agent": "The-Witness-Divine-Sister-Court/4.0"}
+    headers = {"User-Agent": "The-Witness-Divine-Sister-Court/4.1"}
     timeout = aiohttp.ClientTimeout(total=45)
 
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
