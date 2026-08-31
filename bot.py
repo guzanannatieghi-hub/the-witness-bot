@@ -51,10 +51,12 @@ CURRENT_SERVER_CHANNEL = "current-server"
 # De Pride Isle Sanatorium
 DPI_PLACE_ID = 3522803956
 DPI_UNIVERSE_ID = 1246853548
-PRESENCE_SCAN_MINUTES = 2
+PRESENCE_SCAN_MINUTES = 5
 CURRENT_SERVER_REFRESH_MINUTES = 5
 PRESENCE_STATE_FILE = "witness_presence_state.json"
 CURRENT_SERVER_STATE_FILE = "witness_current_server_state.json"
+PRESENCE_CACHE_SECONDS = 240
+PRESENCE_BATCH_SIZE = 25
 
 STAFF_SCAN_MINUTES = 5
 LEADER_GRAPH_MINUTES = 30
@@ -81,6 +83,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 scan_lock = asyncio.Lock()
 graph_lock = asyncio.Lock()
+presence_lock = asyncio.Lock()
+presence_cache = {}
+presence_cache_at = None
 
 
 # =========================================================
@@ -420,12 +425,10 @@ async def probe_friends_visibility(session, user_id):
 
 async def get_user_presences(session, user_ids):
     """
-    Fetch Roblox public presence safely without exceeding the API's
-    per-request user-ID limit.
+    Rate-safe Roblox public presence fetch.
 
-    Starts with conservative batches of 50. If Roblox ever lowers the
-    accepted batch size, a rejected batch is automatically split in half
-    and retried instead of breaking the whole current-server scan.
+    Uses small batches, automatic split fallback, and exponential backoff
+    for HTTP 429 so one Roblox throttle does not kill the whole watcher.
     """
     if not user_ids:
         return {}
@@ -437,48 +440,118 @@ async def get_user_presences(session, user_ids):
         if not batch:
             return
 
-        try:
-            data = await request_json(
-                session,
-                "POST",
-                f"{PRESENCE_API}/v1/presence/users",
-                payload={"userIds": batch},
-            )
+        for attempt in range(7):
+            try:
+                async with session.post(
+                    f"{PRESENCE_API}/v1/presence/users",
+                    json={"userIds": batch},
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
 
-        except RuntimeError as exc:
-            message = str(exc).lower()
+                        for item in data.get("userPresences", []):
+                            user_id = item.get("userId")
+                            if user_id is not None:
+                                results[str(user_id)] = item
 
-            # Roblox returns HTTP 400 / code 3 when too many IDs are sent.
-            # Split automatically so future API-limit changes do not kill
-            # the entire roster watcher.
-            if (
-                "too many user ids" in message
-                and len(batch) > 1
-            ):
-                middle = len(batch) // 2
+                        return
 
-                await fetch_batch(batch[:middle])
-                await asyncio.sleep(0.15)
-                await fetch_batch(batch[middle:])
-                return
+                    body = await response.text()
 
-            raise
+                    if (
+                        response.status == 400
+                        and "too many user ids" in body.lower()
+                        and len(batch) > 1
+                    ):
+                        middle = max(1, len(batch) // 2)
 
-        for item in data.get("userPresences", []):
-            user_id = item.get("userId")
+                        await fetch_batch(batch[:middle])
+                        await asyncio.sleep(0.35)
+                        await fetch_batch(batch[middle:])
+                        return
 
-            if user_id is not None:
-                results[str(user_id)] = item
+                    if response.status == 429:
+                        retry_after = response.headers.get("Retry-After")
 
-    # 50 is intentionally conservative for Roblox Presence.
-    for offset in range(0, len(ids), 50):
-        batch = ids[offset:offset + 50]
+                        try:
+                            wait = (
+                                float(retry_after)
+                                if retry_after
+                                else 0.0
+                            )
+                        except (TypeError, ValueError):
+                            wait = 0.0
+
+                        if wait <= 0:
+                            wait = min(
+                                4.0 * (2 ** attempt),
+                                60.0,
+                            )
+
+                        print(
+                            "Witness presence: rate limited; "
+                            f"waiting {wait:.1f}s before retry."
+                        )
+
+                        await asyncio.sleep(
+                            min(max(wait, 2.0), 60.0)
+                        )
+                        continue
+
+                    if 500 <= response.status < 600:
+                        wait = min(
+                            2.5 * (2 ** attempt),
+                            30.0,
+                        )
+
+                        await asyncio.sleep(wait)
+                        continue
+
+                    raise RuntimeError(
+                        f"Roblox Presence API "
+                        f"{response.status}: "
+                        f"{body[:250]}"
+                    )
+
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as exc:
+                if attempt >= 6:
+                    raise
+
+                wait = min(
+                    2.0 * (2 ** attempt),
+                    30.0,
+                )
+
+                print(
+                    "Witness presence network error:",
+                    repr(exc),
+                    f"retrying in {wait:.1f}s",
+                )
+
+                await asyncio.sleep(wait)
+
+        raise RuntimeError(
+            "Roblox Presence API remained unavailable "
+            "after retries."
+        )
+
+    for offset in range(
+        0,
+        len(ids),
+        PRESENCE_BATCH_SIZE,
+    ):
+        batch = ids[
+            offset:
+            offset + PRESENCE_BATCH_SIZE
+        ]
 
         await fetch_batch(batch)
 
-        if offset + 50 < len(ids):
-            # Gentle spacing between requests to reduce burst pressure.
-            await asyncio.sleep(0.25)
+        if offset + PRESENCE_BATCH_SIZE < len(ids):
+            await asyncio.sleep(0.60)
 
     return results
 
@@ -2435,6 +2508,95 @@ async def before_graph_refresh():
 
 
 
+
+# =========================================================
+# SHARED PRESENCE CACHE
+# =========================================================
+
+def _presence_cache_fresh():
+    if presence_cache_at is None:
+        return False
+
+    age = (
+        utc_now() - presence_cache_at
+    ).total_seconds()
+
+    return age < PRESENCE_CACHE_SECONDS
+
+
+async def get_shared_staff_presences(
+    snapshot=None,
+):
+    """
+    Share one Roblox presence result between:
+    - leadership join watcher
+    - current-server roster
+    - /presencecheck
+    - /currentservers
+
+    This prevents simultaneous 5-minute tasks or repeated commands
+    from duplicating API traffic.
+    """
+    global presence_cache
+    global presence_cache_at
+
+    if snapshot is None:
+        snapshot = await ensure_snapshot()
+
+    people = all_tracked_people(snapshot)
+
+    wanted_ids = {
+        str(user_id)
+        for user_id in people.keys()
+    }
+
+    if (
+        _presence_cache_fresh()
+        and wanted_ids.issubset(
+            set(presence_cache.keys())
+        )
+    ):
+        return snapshot, dict(presence_cache)
+
+    async with presence_lock:
+        if (
+            _presence_cache_fresh()
+            and wanted_ids.issubset(
+                set(presence_cache.keys())
+            )
+        ):
+            return snapshot, dict(presence_cache)
+
+        headers = {
+            "User-Agent":
+            "The-Witness-Divine-Sister-Court/5.0"
+        }
+
+        timeout = aiohttp.ClientTimeout(
+            total=180
+        )
+
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+        ) as session:
+            fresh = await get_user_presences(
+                session,
+                list(people.keys()),
+            )
+
+        presence_cache = fresh
+        presence_cache_at = utc_now()
+
+        print(
+            f"Witness presence cache: "
+            f"{len(fresh)}/{len(people)} "
+            "tracked users returned."
+        )
+
+        return snapshot, dict(fresh)
+
+
 # =========================================================
 # LEADERSHIP PRESENCE WATCH
 # =========================================================
@@ -2555,9 +2717,7 @@ async def perform_presence_scan(
     post_joins=True,
 ):
     snapshot = await ensure_snapshot()
-    leaders = tracked_leadership(
-        snapshot
-    )
+    leaders = tracked_leadership(snapshot)
 
     if not leaders:
         return {
@@ -2567,23 +2727,13 @@ async def perform_presence_scan(
             "hidden_or_other": 0,
         }
 
-    headers = {
-        "User-Agent":
-        "The-Witness-Divine-Sister-Court/3.0"
-    }
-
-    timeout = aiohttp.ClientTimeout(
-        total=30
-    )
-
-    async with aiohttp.ClientSession(
-        headers=headers,
-        timeout=timeout,
-    ) as session:
-        presences = await get_user_presences(
-            session,
-            list(leaders.keys()),
+    # IMPORTANT: no second Roblox scan here.
+    # Reuse the same cached staff-presence result as #current-server.
+    snapshot, presences = (
+        await get_shared_staff_presences(
+            snapshot
         )
+    )
 
     previous = load_json(
         PRESENCE_STATE_FILE,
@@ -2644,8 +2794,6 @@ async def perform_presence_scan(
                     presence,
             })
 
-        # Only announce a transition from "not currently known in DPI"
-        # to "currently visible in DPI". This prevents repeated spam.
         if (
             is_dpi
             and not was_dpi
@@ -2681,7 +2829,6 @@ async def perform_presence_scan(
         "hidden_or_other":
             len(leaders) - len(in_dpi),
     }
-
 
 @tasks.loop(
     minutes=PRESENCE_SCAN_MINUTES
@@ -3084,20 +3231,12 @@ async def publish_current_server_roster(guild, snapshot, presences):
     )
 
 
-async def get_current_staff_presences(snapshot=None):
-    if snapshot is None:
-        snapshot = await ensure_snapshot()
-
-    people = all_tracked_people(snapshot)
-
-    headers = {"User-Agent": "The-Witness-Divine-Sister-Court/4.1"}
-    timeout = aiohttp.ClientTimeout(total=45)
-
-    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        presences = await get_user_presences(session, list(people.keys()))
-
-    return snapshot, presences
-
+async def get_current_staff_presences(
+    snapshot=None,
+):
+    return await get_shared_staff_presences(
+        snapshot
+    )
 
 async def refresh_current_servers_once():
     snapshot = await ensure_snapshot()
