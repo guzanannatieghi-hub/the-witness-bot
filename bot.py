@@ -14,6 +14,14 @@ from dotenv import load_dotenv
 # THE WITNESS — DIVINE SISTER COURT
 # Efficient Edition
 #
+# Reliability v6:
+# - non-blocking Discord startup
+# - single-flight snapshot initialization
+# - concurrency-limited staff-role fetches
+# - no giant low-rank scans every 5 minutes
+# - rate-safe presence cache remains shared
+# - Dormant transitions stay exact; unknown previous ranks are not guessed
+#
 # Main optimization:
 # Instead of downloading 71 Nannies' friend lists for a team scan,
 # The Witness downloads each LEADER'S friend list once and builds a
@@ -92,6 +100,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 scan_lock = asyncio.Lock()
 graph_lock = asyncio.Lock()
 presence_lock = asyncio.Lock()
+snapshot_lock = asyncio.Lock()
 presence_cache = {}
 presence_cache_at = None
 
@@ -596,6 +605,17 @@ def presence_location_text(presence):
 # =========================================================
 
 async def build_snapshot():
+    """
+    Build the current Divine Sister staff snapshot.
+
+    Reliability design:
+    - Staff roles are fetched concurrently with a small semaphore.
+    - Only the Dormant low-rank role is fetched every cycle.
+    - Huge Member/Divinor/Tourist/Refugee roles are deliberately NOT
+      enumerated every five minutes; doing so can take minutes and stall
+      startup. New staff from those roles are logged as previous-rank
+      unavailable rather than guessed incorrectly.
+    """
     staff = {}
     role_snapshot = {}
     leaders = {}
@@ -603,18 +623,20 @@ async def build_snapshot():
 
     headers = {
         "User-Agent":
-        "The-Witness-Divine-Sister-Court/2.0"
+        "The-Witness-Divine-Sister-Court/6.0"
     }
 
-    timeout = aiohttp.ClientTimeout(total=120)
+    timeout = aiohttp.ClientTimeout(total=150)
 
     async with aiohttp.ClientSession(
         headers=headers,
         timeout=timeout,
     ) as session:
 
-        group_info = await get_group_info(session)
-        roles = await get_group_roles(session)
+        group_info, roles = await asyncio.gather(
+            get_group_info(session),
+            get_group_roles(session),
+        )
 
         staff_roles = sorted(
             [
@@ -627,12 +649,59 @@ async def build_snapshot():
             int(role.get("rank", 0)),
         )
 
+        dormant_roles = [
+            role
+            for role in roles
+            if int(role.get("rank", 0)) < STAFF_MIN_RANK
+            and "dormant" in role.get("name", "").lower()
+        ]
+
         print(
-            f"Witness: scanning "
-            f"{len(staff_roles)} staff roles..."
+            f"Witness: fast-scanning "
+            f"{len(staff_roles)} staff roles "
+            f"+ {len(dormant_roles)} Dormant role(s)..."
         )
 
-        for role in staff_roles:
+        # Small concurrency = much faster than 32 fully sequential role calls,
+        # without bursting Roblox with dozens of simultaneous requests.
+        role_semaphore = asyncio.Semaphore(5)
+
+        async def fetch_role(role):
+            async with role_semaphore:
+                users = await get_users_in_role(
+                    session,
+                    role.get("id"),
+                )
+
+                # Gentle staggering between completed role scans.
+                await asyncio.sleep(0.08)
+
+                return role, users
+
+        fetched = await asyncio.gather(
+            *[
+                fetch_role(role)
+                for role in (
+                    staff_roles
+                    + dormant_roles
+                )
+            ],
+            return_exceptions=True,
+        )
+
+        failed_roles = 0
+
+        for result in fetched:
+            if isinstance(result, Exception):
+                failed_roles += 1
+                print(
+                    "Witness role scan warning:",
+                    repr(result),
+                )
+                continue
+
+            role, users = result
+
             role_id = role.get("id")
             role_name = role.get(
                 "name",
@@ -642,96 +711,91 @@ async def build_snapshot():
                 role.get("rank", 0)
             )
 
-            users = await get_users_in_role(
-                session,
-                role_id,
-            )
-
             role_snapshot[str(role_id)] = {
                 "name": role_name,
                 "rank": role_rank,
                 "count": len(users),
             }
 
-            for user_id, info in users.items():
-                staff[user_id] = {
-                    "username":
-                    info["username"],
-
-                    "display_name":
-                    info["display_name"],
-
-                    "role_id":
-                    role_id,
-
-                    "role_name":
-                    role_name,
-
-                    "role_rank":
-                    role_rank,
-                }
-
-                lower = role_name.lower()
-
-                if (
-                    "matrona" in lower
-                    or "reverend" in lower
-                ):
-                    leaders[user_id] = {
+            if role_rank >= STAFF_MIN_RANK:
+                for user_id, info in users.items():
+                    staff[user_id] = {
                         "username":
                         info["username"],
 
                         "display_name":
                         info["display_name"],
 
+                        "role_id":
+                        role_id,
+
                         "role_name":
                         role_name,
 
-                        "category": (
-                            "Matrona"
-                            if "matrona" in lower
-                            else "Reverend"
-                        ),
+                        "role_rank":
+                        role_rank,
                     }
 
-        # Track only the non-staff roles needed for accurate
-        # staff-entry / Dormant movement classification.
-        # This avoids scanning every low-rank role while still distinguishing
-        # Dormant, Refugee, Divinor, Tourist and Member origins.
-        low_roles = [
-            role
-            for role in roles
-            if int(role.get("rank", 0)) < STAFF_MIN_RANK
-            and any(
-                keyword in role.get("name", "").lower()
-                for keyword in LOW_ROLE_KEYWORDS
+                    lower = role_name.lower()
+
+                    if (
+                        "matrona" in lower
+                        or "reverend" in lower
+                    ):
+                        leaders[user_id] = {
+                            "username":
+                            info["username"],
+
+                            "display_name":
+                            info["display_name"],
+
+                            "role_name":
+                            role_name,
+
+                            "category": (
+                                "Matrona"
+                                if "matrona" in lower
+                                else "Reverend"
+                            ),
+                        }
+
+            elif "dormant" in role_name.lower():
+                for user_id, info in users.items():
+                    low_members[user_id] = {
+                        "username":
+                        info["username"],
+
+                        "display_name":
+                        info["display_name"],
+
+                        "role_id":
+                        role_id,
+
+                        "role_name":
+                        role_name,
+
+                        "role_rank":
+                        role_rank,
+                    }
+
+        # Do not silently publish a badly incomplete snapshot.
+        # If multiple staff-role requests failed and we already have an older
+        # valid snapshot, keep that older snapshot for this cycle.
+        if failed_roles:
+            existing = load_json(
+                STATE_FILE,
+                {},
             )
-        ]
 
-        for role in low_roles:
-            role_id = role.get("id")
-            role_name = role.get("name", "Unknown Role")
-            role_rank = int(role.get("rank", 0))
-
-            users = await get_users_in_role(
-                session,
-                role_id,
-            )
-
-            role_snapshot[str(role_id)] = {
-                "name": role_name,
-                "rank": role_rank,
-                "count": len(users),
-            }
-
-            for user_id, info in users.items():
-                low_members[user_id] = {
-                    "username": info["username"],
-                    "display_name": info["display_name"],
-                    "role_id": role_id,
-                    "role_name": role_name,
-                    "role_rank": role_rank,
-                }
+            if (
+                existing.get("staff")
+                and failed_roles >= 3
+            ):
+                print(
+                    f"Witness: {failed_roles} role scans failed; "
+                    "keeping previous valid snapshot this cycle."
+                )
+                return existing
 
         # Divine Sister / group owner automatically.
         owner = group_info.get("owner")
@@ -750,12 +814,20 @@ async def build_snapshot():
 
             if owner_id is not None:
                 leaders[str(owner_id)] = {
-                    "username": owner_name,
+                    "username":
+                    owner_name,
+
                     "display_name":
-                    owner.get("displayName", ""),
+                    owner.get(
+                        "displayName",
+                        "",
+                    ),
+
                     "role_name":
                     "Divine Sister / Group Owner",
-                    "category": "Owner",
+
+                    "category":
+                    "Owner",
                 }
 
     snapshot = {
@@ -771,8 +843,14 @@ async def build_snapshot():
         snapshot,
     )
 
-    return snapshot
+    print(
+        f"Witness snapshot ready: "
+        f"{len(staff)} staff, "
+        f"{len(leaders)} leadership, "
+        f"{len(low_members)} Dormant."
+    )
 
+    return snapshot
 
 async def ensure_snapshot():
     snapshot = load_json(
@@ -781,14 +859,26 @@ async def ensure_snapshot():
     )
 
     if (
-        not snapshot
-        or not snapshot.get("staff")
-        or not snapshot.get("leaders")
+        snapshot.get("staff")
+        and snapshot.get("leaders")
     ):
+        return snapshot
+
+    # All startup tasks share this lock. Only ONE of them performs the
+    # expensive first group scan; the others simply await the result.
+    async with snapshot_lock:
+        snapshot = load_json(
+            STATE_FILE,
+            {},
+        )
+
+        if (
+            snapshot.get("staff")
+            and snapshot.get("leaders")
+        ):
+            return snapshot
+
         return await build_snapshot()
-
-    return snapshot
-
 
 # =========================================================
 # LEADERSHIP FRIEND GRAPH
@@ -2336,50 +2426,153 @@ def detect_transition_candidates(
             continue
 
         new = new_low.get(user_id)
-        if not new or not is_dormant_role(new):
+
+        if (
+            not new
+            or not is_dormant_role(new)
+        ):
             continue
 
         events.append({
-            "type": "staff_to_dormant",
-            "user_id": user_id,
-            "username": old.get("username", new.get("username", "Unknown")),
-            "old_role_id": old.get("role_id"),
-            "old_role_name": old.get("role_name", "Staff"),
-            "old_role_rank": int(old.get("role_rank", 0) or 0),
-            "new_role_id": new.get("role_id"),
-            "new_role_name": new.get("role_name", "Dormant"),
-            "new_role_rank": int(new.get("role_rank", 0) or 0),
+            "type":
+                "staff_to_dormant",
+
+            "user_id":
+                user_id,
+
+            "username":
+                old.get(
+                    "username",
+                    new.get(
+                        "username",
+                        "Unknown",
+                    ),
+                ),
+
+            "old_role_id":
+                old.get("role_id"),
+
+            "old_role_name":
+                old.get(
+                    "role_name",
+                    "Staff",
+                ),
+
+            "old_role_rank":
+                int(
+                    old.get(
+                        "role_rank",
+                        0,
+                    )
+                    or 0
+                ),
+
+            "new_role_id":
+                new.get("role_id"),
+
+            "new_role_name":
+                new.get(
+                    "role_name",
+                    "Dormant",
+                ),
+
+            "new_role_rank":
+                int(
+                    new.get(
+                        "role_rank",
+                        0,
+                    )
+                    or 0
+                ),
         })
 
-    # Selected non-staff -> Staff.
+    # Non-staff -> Staff.
     for user_id, new in new_staff.items():
         if user_id in old_staff:
             continue
 
         old = old_low.get(user_id)
-        if not old:
-            continue
 
-        event_type = (
-            "dormant_to_staff"
-            if is_dormant_role(old)
-            else "low_to_staff"
-        )
+        if old and is_dormant_role(old):
+            event_type = (
+                "dormant_to_staff"
+            )
+            old_role_name = old.get(
+                "role_name",
+                "Dormant",
+            )
+            old_role_id = old.get(
+                "role_id"
+            )
+            old_role_rank = int(
+                old.get(
+                    "role_rank",
+                    0,
+                )
+                or 0
+            )
+
+        else:
+            # We deliberately do not scan giant low-rank populations every
+            # five minutes. Therefore the bot refuses to invent "Member".
+            event_type = (
+                "unknown_to_staff"
+            )
+            old_role_name = (
+                "Previous non-staff role unavailable"
+            )
+            old_role_id = None
+            old_role_rank = 0
 
         events.append({
-            "type": event_type,
-            "user_id": user_id,
-            "username": new.get("username", old.get("username", "Unknown")),
-            "old_role_id": old.get("role_id"),
-            "old_role_name": old.get("role_name", "Non-staff"),
-            "old_role_rank": int(old.get("role_rank", 0) or 0),
-            "new_role_id": new.get("role_id"),
-            "new_role_name": new.get("role_name", "Staff"),
-            "new_role_rank": int(new.get("role_rank", 0) or 0),
+            "type":
+                event_type,
+
+            "user_id":
+                user_id,
+
+            "username":
+                new.get(
+                    "username",
+                    (
+                        old.get(
+                            "username",
+                            "Unknown",
+                        )
+                        if old
+                        else "Unknown"
+                    ),
+                ),
+
+            "old_role_id":
+                old_role_id,
+
+            "old_role_name":
+                old_role_name,
+
+            "old_role_rank":
+                old_role_rank,
+
+            "new_role_id":
+                new.get("role_id"),
+
+            "new_role_name":
+                new.get(
+                    "role_name",
+                    "Staff",
+                ),
+
+            "new_role_rank":
+                int(
+                    new.get(
+                        "role_rank",
+                        0,
+                    )
+                    or 0
+                ),
         })
 
     return events
-
 
 def confirm_transition_events(candidates):
     pending = load_json(
@@ -2451,8 +2644,13 @@ async def post_transition_log(guild, events):
         [e for e in events if e["type"] == "dormant_to_staff"],
         key=transition_sort_key,
     )
-    low_to_staff = sorted(
-        [e for e in events if e["type"] == "low_to_staff"],
+    unknown_to_staff = sorted(
+        [
+            e
+            for e in events
+            if e["type"]
+            == "unknown_to_staff"
+        ],
         key=transition_sort_key,
     )
 
@@ -2480,16 +2678,21 @@ async def post_transition_log(guild, events):
             "### 🌅 DORMANT → STAFF RETURN\n" + "\n\n".join(lines)
         )
 
-    if low_to_staff:
+    if unknown_to_staff:
         lines = []
-        for event in low_to_staff:
+
+        for event in unknown_to_staff:
             lines.append(
                 f"🪪 **{event['username']}**\n"
-                f"↳ {event['old_role_name']} → **{event['new_role_name']}**\n"
-                f"↳ [Roblox profile]({profile_url(event['user_id'])})"
+                f"↳ Previous low rank: **not cached**\n"
+                f"↳ → **{event['new_role_name']}**\n"
+                f"↳ [Roblox profile]"
+                f"({profile_url(event['user_id'])})"
             )
+
         sections.append(
-            "### 🆕 NON-STAFF → STAFF ENTRY\n" + "\n\n".join(lines)
+            "### 🆕 NEW STAFF — PREVIOUS LOW RANK UNKNOWN\n"
+            + "\n\n".join(lines)
         )
 
     description = "\n\n".join(sections)
@@ -2522,7 +2725,7 @@ async def post_transition_log(guild, events):
         embed.set_footer(
             text=(
                 f"The Witness • {CONFIRM_SCANS}-scan confirmation • "
-                "Dormant returns are separated from ordinary new-staff entries"
+                "Dormant returns are exact; other previous low ranks are never guessed"
             )
         )
 
@@ -2734,7 +2937,9 @@ async def promotion_connection_watch():
                 {},
             )
 
-            snapshot = await build_snapshot()
+            async with snapshot_lock:
+                snapshot = await build_snapshot()
+
             current = snapshot["staff"]
 
             # Reuse this exact snapshot for Dormant/non-staff movement.
@@ -2984,7 +3189,7 @@ def _discord_relative_time(dt):
 
 def _presence_cache_relative_time():
     if presence_cache_at is None:
-        return "waiting for first scan"
+        return "initializing — first fast scan in progress"
 
     return _discord_relative_time(
         presence_cache_at
@@ -3845,7 +4050,7 @@ async def on_ready():
     )
 
     if not synced_once:
-        # Remove old guild duplicates.
+        # Remove old guild command duplicates once.
         for guild in bot.guilds:
             try:
                 bot.tree.clear_commands(
@@ -3879,37 +4084,38 @@ async def on_ready():
 
         synced_once = True
 
-    try:
-        snapshot = await ensure_snapshot()
-
-        # Build efficient graph immediately if missing/stale.
-        await ensure_leader_graph(
-            snapshot
-        )
-
-    except Exception as exc:
-        print(
-            "Initial Witness cache error:",
-            repr(exc),
-        )
-
-    if not promotion_connection_watch.is_running():
+    # IMPORTANT:
+    # Do not await a huge Roblox group/friends scan inside on_ready.
+    # Start all background workers immediately. snapshot_lock ensures that
+    # only one worker performs the first snapshot build while the rest wait.
+    if (
+        not promotion_connection_watch
+        .is_running()
+    ):
         promotion_connection_watch.start()
 
-    if not leader_graph_refresh.is_running():
+    if (
+        not leader_graph_refresh
+        .is_running()
+    ):
         leader_graph_refresh.start()
 
-    if not leadership_presence_watch.is_running():
+    if (
+        not leadership_presence_watch
+        .is_running()
+    ):
         leadership_presence_watch.start()
 
-    if not current_server_roster_watch.is_running():
-        try:
-            await refresh_current_servers_once()
-        except Exception as exc:
-            print("Initial current-server refresh error:", repr(exc))
-
+    if (
+        not current_server_roster_watch
+        .is_running()
+    ):
         current_server_roster_watch.start()
 
+    print(
+        "Witness background workers started. "
+        "Fast snapshot initialization running."
+    )
 
 # =========================================================
 # START
