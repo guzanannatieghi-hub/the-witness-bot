@@ -2528,14 +2528,15 @@ async def get_shared_staff_presences(
     snapshot=None,
 ):
     """
-    Share one Roblox presence result between:
-    - leadership join watcher
-    - current-server roster
-    - /presencecheck
-    - /currentservers
+    Shared automatic presence scan.
 
-    This prevents simultaneous 5-minute tasks or repeated commands
-    from duplicating API traffic.
+    IMPORTANT:
+    Cache validity is based on scan AGE, not on whether Roblox returned
+    every requested user. Hidden/offline users may be absent from a public
+    presence response, and treating those absences as a broken cache caused
+    manual commands to repeatedly rescan hundreds of accounts.
+
+    The automatic 5-minute watchers still perform the real Roblox scan.
     """
     global presence_cache
     global presence_cache_at
@@ -2545,31 +2546,17 @@ async def get_shared_staff_presences(
 
     people = all_tracked_people(snapshot)
 
-    wanted_ids = {
-        str(user_id)
-        for user_id in people.keys()
-    }
-
-    if (
-        _presence_cache_fresh()
-        and wanted_ids.issubset(
-            set(presence_cache.keys())
-        )
-    ):
+    if _presence_cache_fresh():
         return snapshot, dict(presence_cache)
 
     async with presence_lock:
-        if (
-            _presence_cache_fresh()
-            and wanted_ids.issubset(
-                set(presence_cache.keys())
-            )
-        ):
+        # Another automatic task may have refreshed it while we waited.
+        if _presence_cache_fresh():
             return snapshot, dict(presence_cache)
 
         headers = {
             "User-Agent":
-            "The-Witness-Divine-Sister-Court/5.0"
+            "The-Witness-Divine-Sister-Court/5.1"
         }
 
         timeout = aiohttp.ClientTimeout(
@@ -2585,16 +2572,57 @@ async def get_shared_staff_presences(
                 list(people.keys()),
             )
 
+        # Only replace the cache after a complete successful scan.
         presence_cache = fresh
         presence_cache_at = utc_now()
 
         print(
             f"Witness presence cache: "
-            f"{len(fresh)}/{len(people)} "
-            "tracked users returned."
+            f"{len(fresh)} public presence records returned "
+            f"for {len(people)} tracked accounts."
         )
 
         return snapshot, dict(fresh)
+
+
+def _latest_presence_state_time(state):
+    latest = None
+
+    for item in state.values():
+        value = item.get("last_checked")
+        if not value:
+            continue
+
+        try:
+            parsed = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except Exception:
+            continue
+
+        if latest is None or parsed > latest:
+            latest = parsed
+
+    return latest
+
+
+def _discord_relative_time(dt):
+    if dt is None:
+        return "unknown"
+
+    try:
+        return f"<t:{int(dt.timestamp())}:R>"
+    except Exception:
+        return "unknown"
+
+
+def _presence_cache_relative_time():
+    if presence_cache_at is None:
+        return "waiting for first scan"
+
+    return _discord_relative_time(
+        presence_cache_at
+    )
 
 
 # =========================================================
@@ -2861,32 +2889,94 @@ async def before_leadership_presence_watch():
 @bot.tree.command(
     name="presencecheck",
     description=(
-        "Check which Matronas/Reverends/"
-        "Divine Sister are visibly in DPI now."
+        "Instantly show the latest automatic DPI leadership presence scan."
     ),
 )
 async def presencecheck(
     interaction: discord.Interaction,
 ):
-    await interaction.response.defer(
-        ephemeral=True,
-        thinking=True,
-    )
-
     try:
-        result = await perform_presence_scan(
-            post_joins=False
+        snapshot = load_json(
+            STATE_FILE,
+            {},
         )
 
-        current = result["in_dpi"]
+        leaders = snapshot.get(
+            "leaders",
+            {},
+        )
+
+        state = load_json(
+            PRESENCE_STATE_FILE,
+            {},
+        )
+
+        if not leaders or not state:
+            await interaction.response.send_message(
+                (
+                    "👁️ The Witness is still warming up its "
+                    "automatic presence cache. Try again after "
+                    "the first 5-minute scan."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        current = []
+
+        for user_id, leader in leaders.items():
+            item = state.get(
+                str(user_id),
+                {},
+            )
+
+            if item.get("in_dpi"):
+                current.append(
+                    (
+                        int(
+                            snapshot.get(
+                                "staff",
+                                {},
+                            ).get(
+                                str(user_id),
+                                {},
+                            ).get(
+                                "role_rank",
+                                10000
+                                if leader.get("category") == "Owner"
+                                else 0,
+                            )
+                            or 0
+                        ),
+                        leader,
+                        item,
+                    )
+                )
+
+        current.sort(
+            key=lambda row: (
+                -row[0],
+                row[1].get(
+                    "username",
+                    "",
+                ).lower(),
+            )
+        )
+
+        checked_at = _latest_presence_state_time(
+            state
+        )
 
         if not current:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 (
-                    f"👁️ Checked **{result['tracked']}** "
-                    "leadership accounts. None are "
-                    "currently publicly visible inside "
-                    "De Pride Isle Sanatorium."
+                    f"👁️ **Latest DPI leadership check**\n"
+                    f"No Matrona, Reverend, or Divine Sister/"
+                    f"owner was publicly visible in DPI.\n\n"
+                    f"Last automatic scan: "
+                    f"{_discord_relative_time(checked_at)}\n"
+                    f"Updates automatically every "
+                    f"**{PRESENCE_SCAN_MINUTES} minutes**."
                 ),
                 ephemeral=True,
             )
@@ -2894,36 +2984,54 @@ async def presencecheck(
 
         lines = []
 
-        for item in current:
-            leader = item["leader"]
+        for _, leader, item in current:
+            game_id = item.get(
+                "game_id"
+            )
+
+            server_bit = (
+                f" • server `{game_id}`"
+                if game_id
+                else ""
+            )
 
             lines.append(
                 f"• **{leader.get('username', 'Unknown')}** "
                 f"— {leader.get('role_name', leader.get('category', 'Leadership'))}"
+                f"{server_bit}"
             )
 
-        await interaction.followup.send(
+        await interaction.response.send_message(
             (
-                f"👁️ **Currently visible in DPI — "
+                f"👁️ **Leadership publicly visible in DPI — "
                 f"{len(current)}**\n"
                 + "\n".join(lines)
-                + "\n\nPresence privacy can hide some users."
+                + f"\n\nLast automatic scan: "
+                + _discord_relative_time(checked_at)
+                + f" • updates every **{PRESENCE_SCAN_MINUTES} min**"
+                + "\nPresence privacy can hide some users."
             ),
             ephemeral=True,
         )
 
     except Exception as exc:
         print(
-            "Manual presence check error:",
+            "Instant presence check error:",
             repr(exc),
         )
 
-        await interaction.followup.send(
-            f"❌ Presence check failed: "
-            f"`{type(exc).__name__}`",
-            ephemeral=True,
-        )
-
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Presence check failed: "
+                f"`{type(exc).__name__}`",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Presence check failed: "
+                f"`{type(exc).__name__}`",
+                ephemeral=True,
+            )
 
 
 
@@ -3263,29 +3371,79 @@ async def before_current_server_roster_watch():
 
 @bot.tree.command(
     name="currentservers",
-    description="Refresh the live DPI staff/server roster now.",
+    description=(
+        "Instantly open the latest automatic DPI server roster."
+    ),
 )
-async def currentservers(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
+async def currentservers(
+    interaction: discord.Interaction,
+):
     try:
-        await refresh_current_servers_once()
-        channel = find_channel(interaction.guild, CURRENT_SERVER_CHANNEL)
+        channel = find_channel(
+            interaction.guild,
+            CURRENT_SERVER_CHANNEL,
+        )
 
-        await interaction.followup.send(
+        if not channel:
+            await interaction.response.send_message(
+                (
+                    f"❌ I cannot find "
+                    f"`#{CURRENT_SERVER_CHANNEL}`."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        # Never trigger a fresh Roblox scan from a slash command.
+        # The automatic watcher owns API traffic and refreshes every 5 min.
+        # If an in-memory cache exists, re-render it in the background using
+        # LOCAL cached data only. The user gets an instant response.
+        snapshot = load_json(
+            STATE_FILE,
+            {},
+        )
+
+        if snapshot and presence_cache:
+            asyncio.create_task(
+                publish_current_server_roster(
+                    interaction.guild,
+                    snapshot,
+                    dict(presence_cache),
+                )
+            )
+
+        await interaction.response.send_message(
             (
-                "🛰️ Current DPI server roster refreshed in "
-                f"{channel.mention if channel else '#current-server'}."
+                f"🛰️ Latest server roster: "
+                f"{channel.mention}\n"
+                f"Last presence cache: "
+                f"**{_presence_cache_relative_time()}**\n"
+                f"It refreshes automatically every "
+                f"**{CURRENT_SERVER_REFRESH_MINUTES} minutes** — "
+                f"this command does **not** hit Roblox again, "
+                f"so it responds instantly and avoids rate limits."
             ),
             ephemeral=True,
         )
 
     except Exception as exc:
-        print("Manual current-server refresh error:", repr(exc))
-        await interaction.followup.send(
-            f"❌ Current server refresh failed: `{type(exc).__name__}`",
-            ephemeral=True,
+        print(
+            "Instant current-server command error:",
+            repr(exc),
         )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Current server command failed: "
+                f"`{type(exc).__name__}`",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Current server command failed: "
+                f"`{type(exc).__name__}`",
+                ephemeral=True,
+            )
 
 
 # =========================================================
