@@ -32,6 +32,9 @@ from dotenv import load_dotenv
 # - detects new staff/promotions (2-scan confirmation)
 # - automatically checks promoted users against cached leadership graph
 # - refreshes leadership friend graph every 30 minutes
+# - pings @Witness on confirmed Matrona/Reverend/Divine Sister DPI joins
+# - logs Staff ↔ Dormant separately in #dormant-log
+# - identifies tracked Refugee/Divinor/Tourist/Member → Staff entries
 #
 # Public Roblox friendship = connection only, NOT proof of favoritism.
 # =========================================================
@@ -47,6 +50,9 @@ STAFF_MIN_RANK = 50
 CONNECTIONS_CHANNEL = "connections"
 PRESENCE_CHANNEL = "leadership-presence"
 CURRENT_SERVER_CHANNEL = "current-server"
+DORMANT_CHANNEL = "dormant-log"
+WITNESS_ROLE_NAME = "Witness"
+LOW_ROLE_KEYWORDS = ("dormant", "refugee", "divinor", "tourist", "member")
 
 # De Pride Isle Sanatorium
 DPI_PLACE_ID = 3522803956
@@ -68,6 +74,8 @@ STAFF_CACHE_FILE = "witness_staff_cache.json"
 PENDING_FILE = "witness_pending.json"
 GRAPH_FILE = "witness_leader_graph.json"
 PRIVACY_FILE = "witness_privacy_cache.json"
+TRANSITION_CACHE_FILE = "witness_transition_cache.json"
+TRANSITION_PENDING_FILE = "witness_transition_pending.json"
 
 GROUPS_API = "https://groups.roblox.com"
 FRIENDS_API = "https://friends.roblox.com"
@@ -591,6 +599,7 @@ async def build_snapshot():
     staff = {}
     role_snapshot = {}
     leaders = {}
+    low_members = {}
 
     headers = {
         "User-Agent":
@@ -685,6 +694,45 @@ async def build_snapshot():
                         ),
                     }
 
+        # Track only the non-staff roles needed for accurate
+        # staff-entry / Dormant movement classification.
+        # This avoids scanning every low-rank role while still distinguishing
+        # Dormant, Refugee, Divinor, Tourist and Member origins.
+        low_roles = [
+            role
+            for role in roles
+            if int(role.get("rank", 0)) < STAFF_MIN_RANK
+            and any(
+                keyword in role.get("name", "").lower()
+                for keyword in LOW_ROLE_KEYWORDS
+            )
+        ]
+
+        for role in low_roles:
+            role_id = role.get("id")
+            role_name = role.get("name", "Unknown Role")
+            role_rank = int(role.get("rank", 0))
+
+            users = await get_users_in_role(
+                session,
+                role_id,
+            )
+
+            role_snapshot[str(role_id)] = {
+                "name": role_name,
+                "rank": role_rank,
+                "count": len(users),
+            }
+
+            for user_id, info in users.items():
+                low_members[user_id] = {
+                    "username": info["username"],
+                    "display_name": info["display_name"],
+                    "role_id": role_id,
+                    "role_name": role_name,
+                    "role_rank": role_rank,
+                }
+
         # Divine Sister / group owner automatically.
         owner = group_info.get("owner")
 
@@ -714,6 +762,7 @@ async def build_snapshot():
         "staff": staff,
         "roles": role_snapshot,
         "leaders": leaders,
+        "low_members": low_members,
         "updated_at": utc_iso(),
     }
 
@@ -2223,6 +2272,18 @@ async def witnessstatus(
     )
 
     embed.add_field(
+        name="Leadership Alert Role",
+        value=f"@{WITNESS_ROLE_NAME}",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Dormant / Entry Log",
+        value=f"#{DORMANT_CHANNEL}",
+        inline=True,
+    )
+
+    embed.add_field(
         name="Current Server Roster",
         value=(
             f"Every {CURRENT_SERVER_REFRESH_MINUTES} min • "
@@ -2242,6 +2303,307 @@ async def witnessstatus(
         embed=embed,
         ephemeral=True,
     )
+
+
+# =========================================================
+# DORMANT + NON-STAFF -> STAFF TRANSITION WATCH
+# =========================================================
+
+def is_dormant_role(info):
+    return "dormant" in info.get("role_name", "").lower()
+
+
+def transition_event_key(event):
+    return (
+        f"{event['type']}:"
+        f"{event['user_id']}:"
+        f"{event.get('old_role_id')}:"
+        f"{event.get('new_role_id')}"
+    )
+
+
+def detect_transition_candidates(
+    old_staff,
+    new_staff,
+    old_low,
+    new_low,
+):
+    events = []
+
+    # Staff -> Dormant.
+    for user_id, old in old_staff.items():
+        if user_id in new_staff:
+            continue
+
+        new = new_low.get(user_id)
+        if not new or not is_dormant_role(new):
+            continue
+
+        events.append({
+            "type": "staff_to_dormant",
+            "user_id": user_id,
+            "username": old.get("username", new.get("username", "Unknown")),
+            "old_role_id": old.get("role_id"),
+            "old_role_name": old.get("role_name", "Staff"),
+            "old_role_rank": int(old.get("role_rank", 0) or 0),
+            "new_role_id": new.get("role_id"),
+            "new_role_name": new.get("role_name", "Dormant"),
+            "new_role_rank": int(new.get("role_rank", 0) or 0),
+        })
+
+    # Selected non-staff -> Staff.
+    for user_id, new in new_staff.items():
+        if user_id in old_staff:
+            continue
+
+        old = old_low.get(user_id)
+        if not old:
+            continue
+
+        event_type = (
+            "dormant_to_staff"
+            if is_dormant_role(old)
+            else "low_to_staff"
+        )
+
+        events.append({
+            "type": event_type,
+            "user_id": user_id,
+            "username": new.get("username", old.get("username", "Unknown")),
+            "old_role_id": old.get("role_id"),
+            "old_role_name": old.get("role_name", "Non-staff"),
+            "old_role_rank": int(old.get("role_rank", 0) or 0),
+            "new_role_id": new.get("role_id"),
+            "new_role_name": new.get("role_name", "Staff"),
+            "new_role_rank": int(new.get("role_rank", 0) or 0),
+        })
+
+    return events
+
+
+def confirm_transition_events(candidates):
+    pending = load_json(
+        TRANSITION_PENDING_FILE,
+        {},
+    )
+
+    next_pending = {}
+    confirmed = []
+
+    for event in candidates:
+        key = transition_event_key(event)
+
+        count = int(
+            pending.get(key, {}).get("count", 0)
+        ) + 1
+
+        if count >= CONFIRM_SCANS:
+            confirmed.append(event)
+        else:
+            next_pending[key] = {
+                "count": count,
+                "event": event,
+            }
+
+    save_json(
+        TRANSITION_PENDING_FILE,
+        next_pending,
+    )
+
+    return confirmed
+
+
+def transition_sort_key(event):
+    if event["type"] == "staff_to_dormant":
+        rank = event.get("old_role_rank", 0)
+    else:
+        rank = event.get("new_role_rank", 0)
+
+    return (
+        -int(rank or 0),
+        event.get("username", "").lower(),
+    )
+
+
+async def post_transition_log(guild, events):
+    if not events:
+        return
+
+    channel = find_channel(
+        guild,
+        DORMANT_CHANNEL,
+    )
+
+    if not channel:
+        print(
+            f"Witness transitions: #{DORMANT_CHANNEL} "
+            f"does not exist in {guild.name}."
+        )
+        return
+
+    sections = []
+
+    staff_to_dormant = sorted(
+        [e for e in events if e["type"] == "staff_to_dormant"],
+        key=transition_sort_key,
+    )
+    dormant_to_staff = sorted(
+        [e for e in events if e["type"] == "dormant_to_staff"],
+        key=transition_sort_key,
+    )
+    low_to_staff = sorted(
+        [e for e in events if e["type"] == "low_to_staff"],
+        key=transition_sort_key,
+    )
+
+    if staff_to_dormant:
+        lines = []
+        for event in staff_to_dormant:
+            lines.append(
+                f"📤 **{event['username']}**\n"
+                f"↳ {event['old_role_name']} → 💤 **{event['new_role_name']}**\n"
+                f"↳ [Roblox profile]({profile_url(event['user_id'])})"
+            )
+        sections.append(
+            "### 💤 STAFF → DORMANT\n" + "\n\n".join(lines)
+        )
+
+    if dormant_to_staff:
+        lines = []
+        for event in dormant_to_staff:
+            lines.append(
+                f"📥 **{event['username']}**\n"
+                f"↳ 💤 {event['old_role_name']} → **{event['new_role_name']}**\n"
+                f"↳ [Roblox profile]({profile_url(event['user_id'])})"
+            )
+        sections.append(
+            "### 🌅 DORMANT → STAFF RETURN\n" + "\n\n".join(lines)
+        )
+
+    if low_to_staff:
+        lines = []
+        for event in low_to_staff:
+            lines.append(
+                f"🪪 **{event['username']}**\n"
+                f"↳ {event['old_role_name']} → **{event['new_role_name']}**\n"
+                f"↳ [Roblox profile]({profile_url(event['user_id'])})"
+            )
+        sections.append(
+            "### 🆕 NON-STAFF → STAFF ENTRY\n" + "\n\n".join(lines)
+        )
+
+    description = "\n\n".join(sections)
+
+    chunks = []
+    while len(description) > 3900:
+        cut = description.rfind("\n\n", 0, 3900)
+        if cut <= 0:
+            cut = 3900
+        chunks.append(description[:cut])
+        description = description[cut:].lstrip()
+
+    if description:
+        chunks.append(description)
+
+    for index, chunk in enumerate(chunks, start=1):
+        suffix = (
+            f" • {index}/{len(chunks)}"
+            if len(chunks) > 1
+            else ""
+        )
+
+        embed = discord.Embed(
+            title=f"📚 DORMANT / STAFF MOVEMENT — {len(events)}{suffix}",
+            description=chunk,
+            colour=discord.Colour.gold(),
+            timestamp=utc_now(),
+        )
+
+        embed.set_footer(
+            text=(
+                f"The Witness • {CONFIRM_SCANS}-scan confirmation • "
+                "Dormant returns are separated from ordinary new-staff entries"
+            )
+        )
+
+        await channel.send(embed=embed)
+
+
+async def process_transition_watch(snapshot):
+    current_staff = snapshot.get("staff", {})
+    current_low = snapshot.get("low_members", {})
+
+    previous = load_json(
+        TRANSITION_CACHE_FILE,
+        {},
+    )
+
+    if not previous:
+        save_json(
+            TRANSITION_CACHE_FILE,
+            {
+                "staff": current_staff,
+                "low": current_low,
+            },
+        )
+        return []
+
+    old_staff = previous.get("staff", {})
+    old_low = previous.get("low", {})
+
+    candidates = detect_transition_candidates(
+        old_staff,
+        current_staff,
+        old_low,
+        current_low,
+    )
+
+    confirmed = confirm_transition_events(
+        candidates
+    )
+
+    baseline_staff = dict(current_staff)
+    baseline_low = dict(current_low)
+
+    confirmed_keys = {
+        transition_event_key(event)
+        for event in confirmed
+    }
+
+    # Preserve previous state for an unconfirmed candidate so the same
+    # transition can be seen again on the second scan.
+    for event in candidates:
+        if transition_event_key(event) in confirmed_keys:
+            continue
+
+        user_id = event["user_id"]
+
+        if user_id in old_staff:
+            baseline_staff[user_id] = old_staff[user_id]
+        else:
+            baseline_staff.pop(user_id, None)
+
+        if user_id in old_low:
+            baseline_low[user_id] = old_low[user_id]
+        else:
+            baseline_low.pop(user_id, None)
+
+    save_json(
+        TRANSITION_CACHE_FILE,
+        {
+            "staff": baseline_staff,
+            "low": baseline_low,
+        },
+    )
+
+    if confirmed:
+        for guild in bot.guilds:
+            await post_transition_log(
+                guild,
+                confirmed,
+            )
+
+    return confirmed
 
 
 # =========================================================
@@ -2374,6 +2736,10 @@ async def promotion_connection_watch():
 
             snapshot = await build_snapshot()
             current = snapshot["staff"]
+
+            # Reuse this exact snapshot for Dormant/non-staff movement.
+            # No second staff scan and no extra API burst.
+            await process_transition_watch(snapshot)
 
             if not previous:
                 save_json(
@@ -2735,8 +3101,25 @@ async def post_presence_joins(guild, joined):
             )
         )
 
+        witness_role = discord.utils.get(
+            guild.roles,
+            name=WITNESS_ROLE_NAME,
+        )
+
+        ping_text = (
+            f"🔔 {witness_role.mention}"
+            if witness_role
+            else None
+        )
+
         await channel.send(
-            embed=embed
+            content=ping_text,
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=True,
+            ),
         )
 
 
